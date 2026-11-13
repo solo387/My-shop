@@ -33,3 +33,6 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Shop data: customers, password hashes, wallets, orders, uploads
+data/
