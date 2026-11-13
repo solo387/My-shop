@@ -136,7 +136,8 @@ function applyPayment(reference, data, source) {
   return tx(() => {
     const p = one('SELECT * FROM payments WHERE reference = ?', reference);
     if (!p) return { ok: false, reason: 'unknown' };
-    if (p.status !== 'pending') return { ok: p.status === 'success', reason: p.status };
+    // 'not_started' = we never got Paystack's answer when opening the payment (e.g. a timeout); the customer may still have paid.
+    if (p.status !== 'pending' && p.status !== 'not_started') return { ok: p.status === 'success', reason: p.status };
     const status = String(data && data.status || '');
     if (status !== 'success') { run('UPDATE payments SET provider_status = ?, updated_at = ? WHERE reference = ?', status.slice(0, 40), now(), reference); return { ok: false, reason: status || 'pending' }; }
     const o = one('SELECT * FROM orders WHERE id = ?', p.order_id);
@@ -159,7 +160,7 @@ function applyPayment(reference, data, source) {
 }
 async function checkPendingPayments(orderId) {
   if (!config.paystack.enabled) return;
-  for (const p of all("SELECT reference FROM payments WHERE order_id = ? AND status = 'pending'", orderId)) {
+  for (const p of all("SELECT reference FROM payments WHERE order_id = ? AND status IN ('pending', 'not_started')", orderId)) {
     try { applyPayment(p.reference, await paystack.verify(p.reference), 'check'); } catch {}
   }
 }
@@ -168,6 +169,8 @@ async function expireUnpaidOrders() {
   const cutoff = new Date(Date.now() - hours * 3600e3).toISOString();
   for (const o of all("SELECT id FROM orders WHERE status = 'awaiting_payment' AND created_at < ?", cutoff)) {
     await checkPendingPayments(o.id);   // never cancel an order that was in fact paid
+    // A payment opened in the last 30 minutes may still be approved on the customer's phone: wait for the next round.
+    if (one("SELECT 1 FROM payments WHERE order_id = ? AND status IN ('pending', 'not_started') AND created_at > ?", o.id, new Date(Date.now() - 30 * 60e3).toISOString())) continue;
     tx(() => { const cur = one('SELECT * FROM orders WHERE id = ?', o.id); if (cur.status === 'awaiting_payment') { cancelOrder(cur, 'expired'); S.audit('system', 'order.expired', cur.number); } });
   }
 }
@@ -220,10 +223,10 @@ route('POST', '/api/register', null, c => {
 route('POST', '/api/login', null, c => {
   if (S.limited('login' + c.ip, 20, 10 * 60e3)) bad('Too many attempts from this network. Try again in a few minutes.', 429);
   const ph = phone(c.body.phone), u = one('SELECT * FROM users WHERE phone = ?', ph);
-  if (S.isLocked('users', u)) bad('This account is locked for 15 minutes after too many wrong passwords.', 429);
+  if (S.isLocked('users', u, c.ip)) bad('Too many wrong passwords. This account is locked for 15 minutes.', 429);
   if (!u) { S.burnTime(c.body.password); bad('Wrong phone number or password', 401); }
-  if (!S.checkPassword(c.body.password, u.pass)) { S.recordFailure('users', u); bad('Wrong phone number or password', 401); }
-  S.recordSuccess('users', u);
+  if (!S.checkPassword(c.body.password, u.pass)) { S.recordFailure('users', u, c.ip); bad('Wrong phone number or password', 401); }
+  S.recordSuccess('users', u, c.ip);
   if (S.needsRehash(u.pass)) run('UPDATE users SET pass = ? WHERE id = ?', S.hashPassword(c.body.password), u.id);
   const csrf = S.createSession(c.res, 'user', u.id, c.ip);
   return { user: userOut(u), csrf };
@@ -237,6 +240,7 @@ route('POST', '/api/me/password', 'user', c => {
   return {};
 });
 route('POST', '/api/orders', 'user', async c => {
+  if (S.limited('order' + c.user.id, 30, 10 * 60e3)) bad('Too many orders in a short time. Wait a few minutes and try again.', 429);
   const method = c.body.method === 'cash' ? 'cash' : 'momo';
   const id = tx(() => {
     const { items, total } = priceItems(c.body.items);
@@ -269,13 +273,14 @@ route('POST', '/api/orders', 'user', async c => {
 });
 route('GET', '/api/orders', 'user', c => all('SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 200', c.user.id).map(o => orderOut(o)));
 route('POST', '/api/orders/:id/pay', 'user', async c => {
+  if (S.limited('pay' + c.user.id, 10, 10 * 60e3)) bad('Too many payment attempts. Wait a few minutes and try again.', 429);
   const o = one('SELECT * FROM orders WHERE id = ? AND user_id = ?', c.id, c.user.id) || bad('Order not found', 404);
   return { payUrl: await startPayment(o, c.user, c.body.email, c.req) };
 });
 route('POST', '/api/payments/verify', 'user', async c => {
   const ref = str(c.body.reference, 100);
   const p = one('SELECT p.* FROM payments p JOIN orders o ON o.id = p.order_id WHERE p.reference = ? AND o.user_id = ?', ref, c.user.id) || bad('Payment not found', 404);
-  if (p.status === 'pending') {
+  if (p.status === 'pending' || p.status === 'not_started') {
     let data; try { data = await paystack.verify(ref); } catch { bad('Could not confirm the payment with Paystack yet. Check again in a minute.', 502); }
     applyPayment(ref, data, 'return');
   }
@@ -308,18 +313,18 @@ route('POST', '/api/paystack/webhook', null, c => {
       const r = applyPayment(String(ev.data.reference).slice(0, 100), ev.data, 'webhook');
       if (r.reason === 'unknown') S.audit('paystack', 'webhook.unknown_reference', String(ev.data.reference).slice(0, 100), '', c.ip);
     }
-  } else S.audit('system', 'webhook.rejected', '', 'bad or missing signature', c.ip);
+  } else if (!S.limited('whlog' + c.ip, 1, 60e3)) S.audit('system', 'webhook.rejected', '', 'bad or missing signature', c.ip);
   return {};   // always 200 so Paystack does not keep retrying events that are handled or forged
-}, { raw: true, noOriginCheck: true });
+}, { raw: true, noOriginCheck: true, maxBody: 1e6 });
 
 // --- admin
 route('POST', '/api/admin/login', null, c => {
   if (S.limited('alogin' + c.ip, 10, 10 * 60e3)) bad('Too many attempts from this network. Try again in a few minutes.', 429);
   const name = str(c.body.username, 60), a = one('SELECT * FROM admins WHERE username = ?', name);
-  if (S.isLocked('admins', a)) { S.audit('system', 'admin.login_locked', a.username, '', c.ip); bad('This admin account is locked for 15 minutes after too many wrong passwords.', 429); }
+  if (S.isLocked('admins', a, c.ip)) { S.audit('system', 'admin.login_locked', a.username, '', c.ip); bad('Too many wrong passwords. Admin sign-in is locked for 15 minutes.', 429); }
   if (!a) { S.burnTime(c.body.password); S.audit('system', 'admin.login_failed', name, '', c.ip); bad('Wrong username or password', 401); }
-  if (!S.checkPassword(c.body.password, a.pass)) { S.recordFailure('admins', a); S.audit('system', 'admin.login_failed', a.username, '', c.ip); bad('Wrong username or password', 401); }
-  S.recordSuccess('admins', a);
+  if (!S.checkPassword(c.body.password, a.pass)) { S.recordFailure('admins', a, c.ip); S.audit('system', 'admin.login_failed', a.username, '', c.ip); bad('Wrong username or password', 401); }
+  S.recordSuccess('admins', a, c.ip);
   if (S.needsRehash(a.pass)) run('UPDATE admins SET pass = ? WHERE id = ?', S.hashPassword(c.body.password), a.id);
   const csrf = S.createSession(c.res, 'admin', a.id, c.ip);
   S.audit(a.username, 'admin.login', '', '', c.ip);
@@ -362,7 +367,7 @@ route('POST', '/api/admin/products', 'admin', c => tx(() => {
   if (c.body.imageData) run('UPDATE products SET image = ? WHERE id = ?', saveImage(c.body.imageData, id), id);
   S.audit(c.admin.username, 'product.create', `#${id} ${f.name}`, { price: f.price, stock: f.stock }, c.ip);
   return productOut(one('SELECT * FROM products WHERE id = ?', id));
-}));
+}), { maxBody: 6e6 });
 route('PUT', '/api/admin/products/:id', 'admin', c => tx(() => {
   const p = one('SELECT * FROM products WHERE id = ?', c.id) || bad('Product not found', 404), f = productFields(c.body);
   let image = p.image;
@@ -373,7 +378,7 @@ route('PUT', '/api/admin/products/:id', 'admin', c => tx(() => {
   const changes = {}; for (const k of ['name', 'price', 'stock', 'active', 'category']) if (String(p[k]) !== String(f[k])) changes[k] = [p[k], f[k]];
   S.audit(c.admin.username, 'product.update', `#${p.id} ${f.name}`, changes, c.ip);
   return productOut(one('SELECT * FROM products WHERE id = ?', p.id));
-}));
+}), { maxBody: 6e6 });
 route('DELETE', '/api/admin/products/:id', 'admin', c => tx(() => {
   const p = one('SELECT * FROM products WHERE id = ?', c.id) || bad('Product not found', 404);
   run('DELETE FROM products WHERE id = ?', p.id); deleteImage(p.image);
@@ -381,7 +386,7 @@ route('DELETE', '/api/admin/products/:id', 'admin', c => tx(() => {
   return {};
 }));
 route('GET', '/api/admin/customers', 'admin', () => all('SELECT u.*, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS orders FROM users u ORDER BY u.id DESC')
-  .map(u => ({ ...userOut(u), orders: u.orders, createdAt: u.created_at, locked: u.locked_until > Date.now() })));
+  .map(u => ({ ...userOut(u), orders: u.orders, createdAt: u.created_at, locked: S.lockedAnywhere('users', u) })));
 route('POST', '/api/admin/customers', 'admin', c => tx(() => {
   const name = str(c.body.name, 80); if (!name) bad('Name is required');
   const ph = phone(c.body.phone); if (one('SELECT 1 FROM users WHERE phone = ?', ph)) bad('That phone number already has an account');
@@ -397,10 +402,10 @@ route('PUT', '/api/admin/customers/:id', 'admin', c => tx(() => {
   const ph = phone(c.body.phone); if (one('SELECT 1 FROM users WHERE phone = ? AND id != ?', ph, u.id)) bad('That phone number is used by another customer');
   run('UPDATE users SET name = ?, phone = ?, email = ? WHERE id = ?', name, ph, email(c.body.email), u.id);
   if (c.body.password) {
-    run('UPDATE users SET pass = ?, failed = 0, locked_until = 0 WHERE id = ?', S.hashPassword(newPassword(c.body.password, { min: 8, phone: ph })), u.id);
+    run('UPDATE users SET pass = ? WHERE id = ?', S.hashPassword(newPassword(c.body.password, { min: 8, phone: ph })), u.id);
     S.endAllSessions('user', u.id);
   }
-  if (c.body.unlock) run('UPDATE users SET failed = 0, locked_until = 0 WHERE id = ?', u.id);
+  if (c.body.unlock || c.body.password) S.unlock('users', u.id);
   S.audit(c.admin.username, 'customer.update', `#${u.id} ${name}`, { passwordReset: !!c.body.password, phoneChanged: ph !== u.phone }, c.ip);
   return userOut(one('SELECT * FROM users WHERE id = ?', u.id));
 }));
@@ -427,7 +432,11 @@ route('POST', '/api/admin/orders/:id/status', 'admin', async c => {
     } else if (a === 'delivered') {
       if (o.status !== 'paid') bad('Confirm payment before marking as delivered');
       run("UPDATE orders SET status = 'delivered', delivered_at = ? WHERE id = ?", now(), o.id);
-    } else if (a === 'cancel') cancelOrder(o, 'admin');
+    } else if (a === 'cancel') {
+      cancelOrder(o, 'admin');
+      if (o.status === 'paid' && o.paid_via === 'paystack')   // the MoMo money has to go back to the customer
+        run("UPDATE payments SET status = 'needs_refund', updated_at = ? WHERE order_id = ? AND status = 'success'", now(), o.id);
+    }
     else bad('Unknown action');
     S.audit(c.admin.username, `order.${a}`, o.number, { method: o.method, due: o.method === 'momo' ? o.momo_due : o.cash_due }, c.ip);
     return orderOut(one('SELECT * FROM orders WHERE id = ?', o.id), true);
@@ -453,12 +462,14 @@ route('PUT', '/api/admin/settings', 'admin', c => tx(() => {
 }));
 
 // ---------- first start: new shop, or import the old db.json ----------
-function seedOrImport(isNew) {
-  if (!isNew) return;
+function seedOrImport() {
+  if (one('SELECT COUNT(*) AS n FROM admins').n > 0) return;   // already set up
   const oldFile = path.join(config.dataDir, 'db.json');
   if (fs.existsSync(oldFile)) {
-    const old = JSON.parse(fs.readFileSync(oldFile, 'utf8'));
-    tx(() => {
+    let old;
+    try { old = JSON.parse(fs.readFileSync(oldFile, 'utf8')); }
+    catch (e) { console.error(`\nCould not read data/db.json (${e.message}). Nothing was changed. Fix or move that file and start again.\n`); process.exit(1); }
+    try { tx(() => {
       for (const [k, v] of Object.entries(old.settings || {})) if (k in DEFAULTS) setSetting(k, v);
       for (const a of old.admins || []) run('INSERT INTO admins (username, pass, default_password, created_at) VALUES (?, ?, ?, ?)', a.username, a.pass, a.defaultPassword ? 1 : 0, now());
       for (const u of old.users || []) run('INSERT INTO users (id, name, phone, pass, wallet, created_at) VALUES (?, ?, ?, ?, ?, ?)', u.id, u.name, u.phone, u.pass, u.wallet, u.createdAt || now());
@@ -473,8 +484,12 @@ function seedOrImport(isNew) {
       }
       for (const t of old.walletTx || []) run('INSERT INTO wallet_tx (user_id, amount, type, note, order_id, balance_after, at) VALUES (?, ?, ?, ?, ?, ?, ?)',
         t.userId, t.amount, t.type, t.note || '', t.orderId || null, t.balanceAfter, t.at);
+      if (!one('SELECT COUNT(*) AS n FROM admins').n) run('INSERT INTO admins (username, pass, default_password, created_at) VALUES (?, ?, 1, ?)', 'admin', S.hashPassword('admin123'), now());
       S.audit('system', 'import.json', 'db.json', { customers: (old.users || []).length, orders: (old.orders || []).length });
-    });
+    }); } catch (e) {
+      console.error(`\nImporting data/db.json failed (${e.message}). Nothing was imported and db.json is untouched; the import will be tried again at the next start.\n`);
+      process.exit(1);
+    }
     fs.renameSync(oldFile, oldFile + '.imported');
     console.log(`Imported your existing shop data from db.json (${(old.users || []).length} customers, ${(old.orders || []).length} orders).`);
     return;
@@ -499,7 +514,13 @@ const SECURITY_HEADERS = {
   ...(config.secure ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {}),
 };
 const reqProto = req => (config.trustProxy && req.headers['x-forwarded-proto'] ? String(req.headers['x-forwarded-proto']).split(',')[0].trim() : (req.socket.encrypted ? 'https' : 'http'));
-const clientIp = req => (config.trustProxy && req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim() : req.socket.remoteAddress) || '';
+// Behind a proxy the visitor's address is the one the proxy appended (counting from the right).
+// The leftmost entries can be typed in by anyone, so they are never trusted.
+function clientIp(req) {
+  const xff = config.trustProxy && req.headers['x-forwarded-for'];
+  if (xff) { const parts = String(xff).split(',').map(x => x.trim()).filter(Boolean); const ip = parts[parts.length - config.proxyHops]; if (ip) return ip; }
+  return req.socket.remoteAddress || '';
+}
 function serveFile(req, res, root, rel) {
   const file = path.normalize(path.join(root, rel));
   if (!file.startsWith(root + path.sep) || path.basename(file).startsWith('.') || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404, SECURITY_HEADERS); return res.end('Not found'); }
@@ -507,11 +528,19 @@ function serveFile(req, res, root, rel) {
   if (req.method === 'HEAD') return res.end();
   fs.createReadStream(file).pipe(res);
 }
+// Reads the request body up to `limit` bytes. Anything bigger gets a clear "too large" answer:
+// the rest is read and thrown away (up to a hard cap) so the browser receives the message instead of a dropped connection.
 function readRaw(req, limit) {
+  const tooBig = () => new HttpError(413, limit > 1e6 ? 'That photo is too large (max 4 MB)' : 'Request too large');
+  if (Number(req.headers['content-length']) > Math.max(limit * 4, 1e6)) { req.resume(); return Promise.reject(tooBig()); }
   return new Promise((resolve, reject) => {
-    const chunks = []; let size = 0;
-    req.on('data', ch => { size += ch.length; if (size > limit) { reject(new HttpError(413, 'That upload is too large (max 4 MB)')); req.destroy(); } else chunks.push(ch); });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    const chunks = []; let size = 0, over = false;
+    req.on('data', ch => {
+      size += ch.length;
+      if (size > Math.max(limit * 4, 1e6)) { req.destroy(); return reject(tooBig()); }
+      if (size > limit) { over = true; chunks.length = 0; } else if (!over) chunks.push(ch);
+    });
+    req.on('end', () => (over ? reject(tooBig()) : resolve(Buffer.concat(chunks))));
     req.on('error', reject);
   });
 }
@@ -537,7 +566,7 @@ async function handle(req, res) {
     if (!/^application\/json/i.test(req.headers['content-type'] || '')) bad('Invalid request', 415);
     // Browsers send Origin on these requests; a request started by another website is refused.
     if (!r.opts.noOriginCheck && req.headers.origin && req.headers.origin !== expectedOrigin(req)) bad('Request blocked: it came from another website', 403);
-    c.raw = await readRaw(req, 6e6);
+    c.raw = await readRaw(req, r.opts.maxBody || 64e3);
     if (!r.opts.raw) { try { c.body = c.raw.length ? JSON.parse(c.raw.toString('utf8')) : {}; } catch { bad('Invalid request'); } if (!c.body || typeof c.body !== 'object' || Array.isArray(c.body)) c.body = {}; }
   }
   const kind = String(r.auth || '').replace('?', '');
@@ -558,14 +587,14 @@ async function handle(req, res) {
 const server = http.createServer((req, res) => handle(req, res).catch(e => {
   if (!(e instanceof HttpError)) console.error(new Date().toISOString(), req.method, req.url, e);
   if (res.headersSent) return res.end();
-  res.writeHead(e instanceof HttpError ? e.code : 500, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
+  res.writeHead(e instanceof HttpError ? e.code : 500, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...(e.code === 413 ? { Connection: 'close' } : {}), ...SECURITY_HEADERS });
   res.end(JSON.stringify({ error: e instanceof HttpError ? e.message : 'Something went wrong on the server. Please try again.' }));
 }));
 server.headersTimeout = 20e3; server.requestTimeout = 60e3;
 
 function start() {
-  const { isNew } = D.open(config.dataDir);
-  seedOrImport(isNew);
+  D.open(config.dataDir);
+  seedOrImport();
   try { D.backup(config.dataDir, config.backupDays); } catch (e) { console.error('Backup failed:', e.message); }
   const safe = fn => () => Promise.resolve().then(fn).catch(e => console.error('Background task failed:', e.message));
   safe(expireUnpaidOrders)();
@@ -576,7 +605,7 @@ function start() {
 
   let port = config.port, tries = 0;
   server.on('error', e => {
-    if (e.code === 'EADDRINUSE' && tries++ < 10 && !process.env.PORT) { console.log(`Port ${port} is busy, trying ${port + 1}...`); port++; setTimeout(() => server.listen(port, config.host), 200); }
+    if (e.code === 'EADDRINUSE' && tries++ < 10 && !config.publicUrl) { console.log(`Port ${port} is busy, trying ${port + 1}...`); port++; setTimeout(() => server.listen(port, config.host), 200); }
     else { console.error('Could not start the shop:', e.message); process.exit(1); }
   });
   server.listen(port, config.host, () => {

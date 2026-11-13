@@ -51,17 +51,19 @@ The easiest option is **Render** (render.com), using the included `render.yaml`:
 3. In the service's Environment settings, set `PUBLIC_URL` to your Render address (for example `https://my-shop.onrender.com`) and add `PAYSTACK_SECRET_KEY`.
 4. To move your existing shop data, upload `data/shop.db` and the `data/uploads` folder to the disk (Render Shell), or start fresh.
 
+Behind a hosting proxy the shop reads the visitor's address from the last entry the proxy adds to `X-Forwarded-For`; if your host puts two proxies in front, set `TRUST_PROXY_HOPS=2`.
+
 Any host that runs Docker works the same way with the included `Dockerfile`: mount a volume at `/var/data` and set `PUBLIC_URL`.
 When `PUBLIC_URL` starts with `https://`, the shop switches on secure cookies, HTTPS-only redirects and HSTS automatically.
 
 ## Security built in
 
 - Passwords hashed with scrypt; customers need at least 8 characters, the admin at least 10; common passwords are refused.
-- Accounts lock for 15 minutes after 5 wrong passwords; sign-in attempts are also limited per network.
+- 5 wrong passwords from one network block that network from the account for 15 minutes (so a stranger cannot lock the real owner out); 30 in a row from anywhere lock the account itself. Sign-in attempts are also limited per network.
 - Session cookies are HttpOnly; only a SHA-256 of each session token is stored. Admin sessions end after 2 hours idle or 12 hours total.
 - Every change carries a per-session CSRF token, and requests started by other websites are refused.
 - Changing a password signs out the other devices.
-- Paystack notices are trusted only with a valid signature; amount and currency are checked before an order is marked paid; duplicate notices are ignored.
+- Paystack notices are trusted only with a valid signature; amount and currency are checked before an order is marked paid; duplicate notices are ignored. A payment still counts if the payment page timed out but the customer paid anyway. Cancelling an order that was paid through Paystack lists it under refunds.
 - Strict security headers (no framing, content security policy, no MIME sniffing).
 - Uploaded photos are checked to be real PNG/JPG/WEBP images.
 - **Activity log** in the admin records every sign-in, wallet change, order change, settings change and payment event.
