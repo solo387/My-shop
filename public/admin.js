@@ -7,10 +7,15 @@ const STATUS = { awaiting_payment: 'Awaiting payment', paid: 'Paid', delivered: 
 const A = { me: null, tab: 'dashboard', products: [], customers: [], orders: [], filter: '', orderFilter: 'open' };
 
 async function api(method, url, body) {
-  const r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && A.me && A.me.csrf) headers['X-CSRF-Token'] = A.me.csrf;
+  let r;
+  try { r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' }); }
+  catch { throw new Error('No connection to the shop server. Is the black shop window still open?'); }
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && A.me) { A.me = null; loginView(); }
-  if (!r.ok) throw new Error(j.error || 'Something went wrong');
+  if (r.status === 401 && A.me) { A.me = null; loginView(); toast('You were signed out. Log in again.', 'err'); }
+  if (!r.ok) throw new Error(j.error || 'Something went wrong. Please try again.');
   return j;
 }
 function toast(text, kind = '') {
@@ -33,7 +38,7 @@ function loginView() {
 }
 
 // ---------- shell ----------
-const TABS = [['dashboard', 'Overview'], ['orders', 'Orders'], ['products', 'Products'], ['customers', 'Customers and wallets'], ['settings', 'Settings']];
+const TABS = [['dashboard', 'Overview'], ['orders', 'Orders'], ['products', 'Products'], ['customers', 'Customers and wallets'], ['activity', 'Activity log'], ['settings', 'Settings']];
 function shell(inner) {
   $('#logoutBtn').hidden = false;
   $('#brand').textContent = A.me.settings.shopName || 'Shop';
@@ -53,6 +58,7 @@ async function show(tab) {
     else if (A.tab === 'orders') await orders();
     else if (A.tab === 'products') await products();
     else if (A.tab === 'customers') await customers();
+    else if (A.tab === 'activity') await activity();
     else settings();
   } catch (e) { shell(`<div class="msg">${esc(e.message)}</div>`); }
 }
@@ -66,6 +72,11 @@ async function dashboard() {
     ${stat('MoMo received', cedi(s.momoCollected))}${stat('Cash received', cedi(s.cashCollected))}
     ${stat('Discount credit redeemed', cedi(s.walletUsed), 'gold')}${stat('Credit still in wallets', cedi(s.walletOutstanding), 'gold')}</div>
     ${s.awaiting ? `<div class="msg warn" style="margin-top:0">${s.awaiting} order${s.awaiting === 1 ? ' is' : 's are'} waiting for payment. <a href="#" data-tab="orders">Review orders</a></div>` : ''}
+    ${s.paymentProblems.length ? `<div class="card" style="border-color:var(--red)"><h3>Payments that need a refund</h3>
+      <div class="hint" style="margin-bottom:8px">Money arrived for an order that was already cancelled or paid, or the amount did not match. Refund it from your Paystack dashboard, then mark it here.</div>
+      ${s.paymentProblems.map(p => `<div class="row" style="padding:8px 0;border-top:1px solid var(--rule)"><span class="grow"><b>${esc(p.number)}</b> <span class="hint">${esc(p.reference)}</span></span>
+        <b>${cedi(p.amount)}</b><span class="badge cancelled">${p.status === 'mismatch' ? 'Amount did not match' : `Order ${esc(STATUS[p.orderStatus] || p.orderStatus).toLowerCase()}`}</span>
+        <button class="small" data-refunded="${esc(p.reference)}">Mark refunded</button></div>`).join('')}</div>` : ''}
     ${s.lowStock.length ? `<div class="card"><h3>Running low</h3><div class="hint" style="margin-bottom:8px">Three or fewer left in stock.</div>${s.lowStock.map(p => `<div class="row" style="padding:6px 0;border-top:1px solid var(--rule)"><span class="grow">${esc(p.name)}</span><span class="badge awaiting_payment">${p.stock} left</span></div>`).join('')}</div>` : ''}
     <div class="card"><h3>How the discount wallet works</h3>
       <div class="hint">On MoMo orders, the order amount is covered by the customer's discount wallet as far as the balance goes. The customer then pays
@@ -87,18 +98,21 @@ async function orders() {
       <div class="hint" style="margin-top:4px">${o.items.map(i => `${i.qty} × ${esc(i.name)} (${cedi(i.price)})`).join(', ')}</div>
       <div class="lines">
         <div><span>Items</span><span>${cedi(o.total)}</span></div>
-        ${o.method === 'momo' ? `<div class="wallet"><span>Covered by discount wallet</span><span>− ${cedi(o.walletDeducted)}</span></div>
+        ${o.method === 'momo' ? `${o.walletDeducted ? `<div class="wallet"><span>Covered by discount wallet</span><span>− ${cedi(o.walletDeducted)}</span></div>
           <div><span>${o.momoPercent}% of the wallet amount</span><span>${cedi(o.walletFee)}</span></div>
-          ${o.remainder ? `<div><span>Not covered by wallet</span><span>${cedi(o.remainder)}</span></div>` : ''}
+          ${o.remainder ? `<div><span>Not covered by wallet</span><span>${cedi(o.remainder)}</span></div>` : ''}` : '<div><span>Discount wallet</span><span>Empty, nothing applied</span></div>'}
           <div class="due"><span>MoMo due${o.payerMomo ? ` (from ${esc(o.payerMomo)})` : ''}</span><span>${cedi(o.momoDue)}</span></div>
-          <div><span>MoMo transaction ID from customer</span><span>${o.momoRef ? esc(o.momoRef) : '<span class="hint" style="font-weight:400">Not entered yet</span>'}</span></div>`
+          ${o.paidVia === 'paystack' ? `<div><span>Paid through Paystack</span><span>${esc(o.momoRef)}</span></div>`
+            : o.paidVia === 'wallet' ? '<div><span>Payment</span><span>Fully covered by wallet</span></div>'
+            : A.me.payments.online ? `<div><span>Paystack attempts</span><span>${o.payments.length ? o.payments.map(p => `${esc(p.status)}`).join(', ') : '<span class="hint" style="font-weight:400">None yet</span>'}</span></div>`
+            : `<div><span>MoMo transaction ID from customer</span><span>${o.momoRef ? esc(o.momoRef) : '<span class="hint" style="font-weight:400">Not entered yet</span>'}</span></div>`}`
         : `<div><span>Discount wallet</span><span>Not used for cash</span></div><div class="due"><span>Cash due</span><span>${cedi(o.cashDue)}</span></div>`}
       </div>
       <div class="row">
-        ${o.status === 'awaiting_payment' ? `<button class="primary small" data-status="paid" data-id="${o.id}">Confirm payment received</button>` : ''}
+        ${o.status === 'awaiting_payment' ? `<button class="${A.me.payments.online && o.method === 'momo' ? '' : 'primary '}small" data-status="paid" data-id="${o.id}">${A.me.payments.online && o.method === 'momo' ? 'Mark paid by hand' : 'Confirm payment received'}</button>` : ''}
         ${o.status === 'paid' ? `<button class="primary small" data-status="delivered" data-id="${o.id}">Mark delivered</button>` : ''}
         ${['awaiting_payment', 'paid'].includes(o.status) ? `<button class="danger small" data-status="cancel" data-id="${o.id}">Cancel order</button>` : ''}
-        <span class="hint">${o.paidAt ? `Paid ${when(o.paidAt)}. ` : ''}${o.deliveredAt ? `Delivered ${when(o.deliveredAt)}. ` : ''}${o.cancelledAt ? `Cancelled ${when(o.cancelledAt)} by ${o.cancelledBy}.` : ''}</span>
+        <span class="hint">${o.paidAt ? `Paid ${when(o.paidAt)}. ` : ''}${o.deliveredAt ? `Delivered ${when(o.deliveredAt)}. ` : ''}${o.cancelledAt ? `Cancelled ${when(o.cancelledAt)} ${{ customer: 'by the customer', admin: 'by admin', expired: 'automatically (not paid in time)' }[o.cancelledBy] || ''}.` : ''}</span>
       </div></div>`).join('') : '<div class="empty">No orders match this filter.</div>'}`);
 }
 
@@ -141,17 +155,20 @@ async function customers() {
       <span class="chip">Credit in wallets ${cedi(list.reduce((s, c) => s + c.wallet, 0))}</span></div>
     <div class="table-wrap"><table class="table"><thead><tr><th>Customer</th><th>Phone</th><th class="num">Discount wallet</th><th class="num">Orders</th><th>Joined</th><th></th></tr></thead><tbody>
     ${list.length ? list.map(c => `<tr>
-      <td><b>${esc(c.name)}</b></td><td>${esc(c.phone)}</td>
+      <td><b>${esc(c.name)}</b>${c.locked ? ' <span class="badge awaiting_payment">Locked</span>' : ''}${c.email ? `<div class="hint">${esc(c.email)}</div>` : ''}</td><td>${esc(c.phone)}</td>
       <td class="num"><b>${cedi(c.wallet)}</b></td><td class="num">${c.orders}</td><td class="hint">${when(c.createdAt).split(',')[0]}</td>
       <td class="actions"><button class="primary small" data-wallet="${c.id}">Adjust wallet</button><button class="small" data-history="${c.id}">History</button><button class="small" data-edit-customer="${c.id}">Edit</button></td></tr>`).join('')
     : `<tr><td colspan="6" class="hint">${A.filter ? 'No customers match your search.' : 'No customers yet. Customers can sign up in the shop, or add one here.'}</td></tr>`}</tbody></table></div>`);
 }
 function customerDlg(c) {
-  const isNew = !c; c = c || { name: '', phone: '' };
+  const isNew = !c; c = c || { name: '', phone: '', email: '' };
   openDlg(`<h2>${isNew ? 'Add customer' : 'Edit customer'}</h2><form id="customerForm" data-id="${c.id || ''}">
     <label for="cn">Full name</label><input id="cn" name="name" value="${esc(c.name)}" required maxlength="80">
     <label for="cp">Phone number (used to log in)</label><input id="cp" name="phone" inputmode="tel" value="${esc(c.phone)}" required>
-    <label for="cpw">${isNew ? 'Password' : 'New password (leave blank to keep current)'}</label><input id="cpw" name="password" type="password" minlength="6" ${isNew ? 'required' : ''} autocomplete="new-password">
+    <label for="ce">Email (optional)</label><input id="ce" name="email" type="email" value="${esc(c.email || '')}" maxlength="120">
+    <label for="cpw">${isNew ? 'Password (at least 8 characters)' : 'New password (leave blank to keep current)'}</label><input id="cpw" name="password" type="password" minlength="8" ${isNew ? 'required' : ''} autocomplete="new-password">
+    ${c.locked ? '<p><label class="inline"><input type="checkbox" name="unlock" value="1"> Unlock this account (locked after too many wrong passwords)</label></p>' : ''}
+    ${isNew ? '' : '<div class="hint">Setting a new password signs the customer out on all their devices.</div>'}
     ${isNew ? '<label for="cw">Opening discount wallet balance (GH₵, optional)</label><input id="cw" name="wallet" type="number" step="0.01" min="0" value="0">' : ''}
     <p><button class="primary">${isNew ? 'Add customer' : 'Save changes'}</button></p></form>`);
 }
@@ -174,6 +191,39 @@ async function historyDlg(c) {
     </tbody></table></div>` : '<div class="empty">No wallet activity yet.</div>'}`);
 }
 
+// ---------- activity log ----------
+const ACTION = {
+  'admin.login': 'Logged in', 'admin.logout': 'Logged out', 'admin.login_failed': 'Failed admin login', 'admin.login_locked': 'Admin login blocked (locked)',
+  'admin.password_changed': 'Changed admin password', 'product.create': 'Added product', 'product.update': 'Edited product', 'product.delete': 'Deleted product',
+  'customer.create': 'Added customer', 'customer.update': 'Edited customer', 'wallet.adjust': 'Adjusted wallet', 'order.paid': 'Order paid', 'order.delivered': 'Order delivered',
+  'order.cancel': 'Order cancelled', 'order.expired': 'Unpaid order cancelled automatically', 'settings.update': 'Changed settings', 'payment.refunded': 'Marked payment refunded',
+  'payment.needs_refund': 'Payment needs a refund', 'payment.mismatch': 'Payment amount did not match', 'webhook.rejected': 'Rejected a fake payment notice',
+  'webhook.unknown_reference': 'Payment notice for an unknown order', 'import.json': 'Imported old shop data',
+};
+function detail(a) {
+  if (!a.detail) return '';
+  try {
+    const d = JSON.parse(a.detail);
+    if (a.action === 'wallet.adjust') return `${d.amount > 0 ? '+' : '−'} ${cedi(Math.abs(d.amount))}, balance ${cedi(d.balance)}${d.note ? ` (${d.note})` : ''}`;
+    if (d.due !== undefined) return `${d.method === 'momo' ? 'MoMo' : 'Cash'} ${cedi(d.due)}`;
+    if (d.expected !== undefined) return `expected ${cedi(d.expected)}, received ${cedi(Number(d.received))} ${d.currency || ''}`;
+    if (d.amount !== undefined && d.reference) return `${cedi(d.amount)} (${d.reference})`;
+    const MONEY = new Set(['amount', 'price', 'openingWallet', 'expected', 'received', 'balance', 'due']);
+    const LABEL = { openingWallet: 'opening wallet', passwordReset: 'password reset', phoneChanged: 'phone changed', momoPercent: 'MoMo %', unpaidExpiryHours: 'unpaid expiry (hours)', shopName: 'shop name', momoNumber: 'MoMo number', momoName: 'MoMo name' };
+    const fmt = (k, v) => MONEY.has(k) && typeof v === 'number' ? cedi(v) : k === 'active' ? (v ? 'shown' : 'hidden') : String(v);
+    return Object.entries(d).filter(([, v]) => v !== false && v !== '' && v != null)
+      .map(([k, v]) => Array.isArray(v) ? `${LABEL[k] || k}: ${fmt(k, v[0])} → ${fmt(k, v[1])}` : v === true ? (LABEL[k] || k) : `${LABEL[k] || k}: ${fmt(k, v)}`).join(', ');
+  } catch { return a.detail; }
+}
+async function activity() {
+  const rows = await api('GET', '/api/admin/audit');
+  shell(`<h1>Activity log</h1><p class="hint" style="margin-top:-8px">Every sign-in, money change and edit, newest first. Entries cannot be edited or deleted from here.</p>
+    <div class="table-wrap"><table class="table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Details</th></tr></thead><tbody>
+    ${rows.length ? rows.map(a => `<tr><td class="hint" style="white-space:nowrap">${when(a.at)}</td><td>${esc(a.actor)}</td>
+      <td><b>${esc(ACTION[a.action] || a.action)}</b>${a.target ? `<div class="hint">${esc(a.target)}</div>` : ''}</td><td class="hint">${esc(detail(a))}${a.ip ? `<div>from ${esc(a.ip)}</div>` : ''}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="hint">Nothing recorded yet.</td></tr>'}</tbody></table></div>`);
+}
+
 // ---------- settings ----------
 function settings() {
   const s = A.me.settings;
@@ -190,9 +240,15 @@ function settings() {
       <p><button class="primary">Save settings</button></p></form></div>
     <div class="card"><h3>Change admin password</h3><form id="passwordForm">
       <label for="pc">Current password</label><input id="pc" name="current" type="password" required autocomplete="current-password">
-      <label for="pn2">New password (at least 6 characters)</label><input id="pn2" name="next" type="password" required minlength="6" autocomplete="new-password">
+      <label for="pn2">New password (at least 10 characters)</label><input id="pn2" name="next" type="password" required minlength="10" autocomplete="new-password">
       <p><button class="primary">Change password</button></p></form></div>
-    <div class="card"><h3>Backups</h3><div class="hint">Everything is stored in the <code>data</code> folder next to <code>server.js</code>: <code>db.json</code> and the product photos. Copy that folder somewhere safe regularly.</div></div>`);
+    <div class="card"><h3>MoMo payments</h3>
+      ${A.me.payments.online ? `<p><span class="badge delivered">Paystack connected</span> <span class="hint">${A.me.payments.mode === 'test' ? 'Test mode: no real money moves.' : 'Live mode: real payments.'}</span></p>
+        <div class="hint">In your Paystack dashboard, under Settings, API Keys and Webhooks, set the webhook URL to <code>${esc(A.me.payments.webhookUrl)}</code></div>`
+        : `<p><span class="badge cancelled">Manual</span></p><div class="hint">Customers send MoMo to your number and you confirm each order. To confirm payments automatically, add your Paystack secret key to the <code>.env</code> file (see README) and restart the shop.</div>`}</div>
+    <div class="card"><h3>Security and backups</h3><div class="hint">
+      ${A.me.hosting.secure ? 'This shop runs over HTTPS.' : 'This shop runs over plain HTTP, which is fine on your own Wi-Fi. Put it on a hosted server with HTTPS before real customers use it (see README).'}
+      Data is stored in <code>shop.db</code> in the <code>data</code> folder. A backup copy is made every day in <code>data/backups</code> (the last 14 are kept). Copy that folder somewhere outside this computer now and then.</div></div>`);
 }
 
 // ---------- events ----------
@@ -200,6 +256,7 @@ document.addEventListener('click', async e => {
   const t = e.target.closest('button, a'); if (!t) return;
   try {
     if (t.dataset.close !== undefined) closeDlg();
+    else if (t.dataset.refunded) { if (!confirm('Only mark this as refunded after you have sent the money back in Paystack. Continue?')) return; await api('POST', `/api/admin/payments/${encodeURIComponent(t.dataset.refunded)}/refunded`, {}); show(); toast('Marked as refunded', 'ok'); }
     else if (t.dataset.ofilter) { A.orderFilter = t.dataset.ofilter; show(); }
     else if (t.dataset.tab) { e.preventDefault(); A.filter = ''; show(t.dataset.tab); }
     else if (t.id === 'logoutBtn') { await api('POST', '/api/admin/logout', {}); A.me = null; loginView(); }
@@ -240,12 +297,26 @@ document.addEventListener('submit', async e => {
       const u = await api('POST', `/api/admin/customers/${f.dataset.id}/wallet`, { amount: amt, note: d.note });
       closeDlg(); show(); toast(`Wallet updated: ${cedi(u.wallet)}`, 'ok');
     } else if (f.id === 'settingsForm') { A.me.settings = await api('PUT', '/api/admin/settings', d); show(); toast('Settings saved', 'ok'); }
-    else if (f.id === 'passwordForm') { await api('POST', '/api/admin/password', d); A.me.defaultPassword = false; show(); toast('Password changed', 'ok'); }
-  } catch (err) { if (f.closest('dialog') || f.id === 'loginForm') formErr(f, err.message); else toast(err.message, 'err'); }
+    else if (f.id === 'passwordForm') {
+      if (d.again !== undefined && d.again !== d.next) throw new Error('The two passwords do not match');
+      await api('POST', '/api/admin/password', { current: d.current, next: d.next }); A.me.defaultPassword = false;
+      await show(f.dataset.first ? 'dashboard' : undefined); toast('Password saved', 'ok');
+    }
+  } catch (err) { if (f.closest('dialog') || f.id === 'loginForm' || f.dataset.first) formErr(f, err.message); else toast(err.message, 'err'); }
   finally { btn.disabled = false; }
 });
+function firstPasswordView() {
+  $('#logoutBtn').hidden = false;
+  $('#view').innerHTML = `<div class="card login"><h2>Set your admin password</h2>
+    <p class="hint">The shop can be opened from other phones and computers on your Wi-Fi, so the default password has to be replaced before you continue.</p>
+    <form id="passwordForm" data-first="1">
+      <input type="hidden" name="current" value="admin123">
+      <label for="fp1">New password (at least 10 characters)</label><input id="fp1" name="next" type="password" required minlength="10" autocomplete="new-password" autofocus>
+      <label for="fp2">Type it again</label><input id="fp2" name="again" type="password" required minlength="10" autocomplete="new-password">
+      <p><button class="primary">Save password and continue</button></p></form></div>`;
+}
 async function boot() {
-  try { A.me = await api('GET', '/api/admin/me'); await show('dashboard'); }
+  try { A.me = await api('GET', '/api/admin/me'); if (A.me.defaultPassword) return firstPasswordView(); await show('dashboard'); }
   catch { A.me = null; loginView(); }
 }
 boot();

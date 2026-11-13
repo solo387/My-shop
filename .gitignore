@@ -36,3 +36,6 @@ google-services.json
 
 # Shop data: customers, password hashes, wallets, orders, uploads
 data/
+
+# Secrets and local settings
+.env

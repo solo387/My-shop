@@ -1,0 +1,19 @@
+# One-click setup on Render (render.com): New > Blueprint > pick this repository.
+# A paid instance is needed because the database must live on a persistent disk.
+services:
+  - type: web
+    name: my-shop
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: shop-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: PUBLIC_URL
+        sync: false          # set to your https://... address in the Render dashboard
+      - key: PAYSTACK_SECRET_KEY
+        sync: false          # paste your Paystack secret key in the Render dashboard

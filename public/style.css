@@ -189,6 +189,7 @@ dialog.pd { width: min(880px, calc(100vw - 24px)); padding: 0; overflow: hidden;
 
 /* ---------- orders ---------- */
 .orders-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.orders-head h1 { white-space: nowrap; }
 .orders-head h1 { margin: 0; }
 .track { display: grid; grid-template-columns: repeat(3, 1fr); margin: 16px 0 6px; position: relative; }
 .track div { text-align: center; font-size: 12.5px; font-weight: 600; color: var(--ink-3); position: relative; padding-top: 22px; }
@@ -232,7 +233,8 @@ dialog .x { position: absolute; top: 12px; right: 12px; border: 0; font-size: 22
 dialog .x:hover { color: var(--ink); background: var(--stone); }
 
 /* ---------- admin ---------- */
-.admin { display: grid; grid-template-columns: 230px 1fr; gap: 30px; align-items: start; }
+.admin { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 30px; align-items: start; }
+.admin > #tab { min-width: 0; }
 .rail { position: sticky; top: 80px; display: flex; flex-direction: column; gap: 2px; background: var(--navy); border-radius: var(--radius-lg); padding: 14px 10px; }
 .rail button { text-align: left; border-radius: var(--radius); padding: 10px 12px; color: #c7cee0; border-color: transparent; background: transparent; }
 .rail button:hover { background: var(--navy-2); color: #fff; }
@@ -281,8 +283,12 @@ dialog .x:hover { color: var(--ink); background: var(--stone); }
   .top { flex-wrap: wrap; }
   .nav { margin-left: auto; }
   .nav .hide-sm { display: none; }
+  .nav > button.ghost { padding: 8px 10px; }
+  #navOrders { text-transform: capitalize; }
   h1 { font-size: 26px; }
-  .admin { grid-template-columns: 1fr; gap: 12px; }
+  .admin { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .orders-head { flex-wrap: wrap; align-items: center; }
+  .orders-head h1 { flex-basis: 100%; }
   .rail { position: static; flex-direction: row; flex-wrap: wrap; }
   .rail .sep, .rail .who, .rail .admin-link { display: none; }
   .card { padding: 16px; }
